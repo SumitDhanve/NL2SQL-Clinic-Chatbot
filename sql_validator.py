@@ -1,86 +1,58 @@
-"""
-sql_validator.py
-================
-Validates AI-generated SQL before execution.
-Only SELECT statements on user tables are permitted.
-No async needed here — pure string/regex logic, always fast.
-"""
+"""SQL safety checks for the NL2SQL pipeline."""
+
+from __future__ import annotations
 
 import re
 
 
 class SQLValidationError(ValueError):
-    """Raised when SQL fails safety checks."""
+    """Raised when generated SQL does not pass safety checks."""
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Compiled regex patterns
-# ──────────────────────────────────────────────────────────────────────────
-
-_FORBIDDEN_STATEMENTS = re.compile(
-    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|REPLACE|MERGE|EXEC|EXECUTE)\b",
+FORBIDDEN_KEYWORDS = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|EXEC|EXECUTE|MERGE|UPSERT|TRUNCATE|ATTACH|DETACH|PRAGMA)\b",
     re.IGNORECASE,
 )
 
-_DANGEROUS_KEYWORDS = re.compile(
-    r"\b(xp_|sp_|GRANT|REVOKE|SHUTDOWN|ATTACH|DETACH|PRAGMA)\b",
+DANGEROUS_KEYWORDS = re.compile(
+    r"\b(xp_|sp_|GRANT|REVOKE|SHUTDOWN)\b",
     re.IGNORECASE,
 )
 
-_SYSTEM_TABLES = re.compile(
-    r"\b(sqlite_master|sqlite_sequence|sqlite_stat\d*|information_schema)\b",
+SYSTEM_TABLES = re.compile(
+    r"\b(sqlite_master|sqlite_schema|sqlite_temp_schema|sqlite_sequence|sqlite_stat\d*)\b",
     re.IGNORECASE,
 )
 
-_SELECT_ONLY = re.compile(
-    r"^\s*(--|/\*.*?\*/)?\s*SELECT\b",
-    re.IGNORECASE | re.DOTALL,
-)
+FIRST_STATEMENT = re.compile(r"^\s*SELECT\b", re.IGNORECASE | re.DOTALL)
+MULTI_STATEMENT = re.compile(r";\s*\S+")
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# Public API
-# ──────────────────────────────────────────────────────────────────────────
 
 def validate_sql(sql: str) -> str:
-    """
-    Validate *sql* and return the cleaned query, or raise SQLValidationError.
-
-    Rules enforced:
-      1. Must start with SELECT (after optional whitespace/comments)
-      2. No forbidden DML/DDL statements
-      3. No dangerous system keywords
-      4. No access to SQLite system tables
-
-    Strips trailing semicolons and surrounding whitespace before returning.
-    """
+    """Return a cleaned SQL string if it is safe to execute."""
     if not sql or not sql.strip():
-        raise SQLValidationError("Empty SQL query.")
+        raise SQLValidationError("The model did not return a SQL query.")
 
-    cleaned = sql.strip().rstrip(";").strip()
+    cleaned = sql.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        cleaned = cleaned.replace("sql", "", 1).strip()
 
-    if not _SELECT_ONLY.match(cleaned):
-        raise SQLValidationError(
-            "Only SELECT statements are allowed. "
-            "The generated query does not start with SELECT."
-        )
+    cleaned = cleaned.rstrip(";").strip()
 
-    if _FORBIDDEN_STATEMENTS.search(cleaned):
-        raise SQLValidationError(
-            "Query contains a forbidden statement type "
-            "(INSERT / UPDATE / DELETE / DROP / ALTER / etc.)."
-        )
+    if not FIRST_STATEMENT.match(cleaned):
+        raise SQLValidationError("Only SELECT queries are allowed.")
 
-    if _DANGEROUS_KEYWORDS.search(cleaned):
-        raise SQLValidationError(
-            "Query contains a dangerous keyword "
-            "(EXEC / GRANT / REVOKE / PRAGMA / etc.)."
-        )
+    if MULTI_STATEMENT.search(cleaned):
+        raise SQLValidationError("Multiple SQL statements are not allowed.")
 
-    if _SYSTEM_TABLES.search(cleaned):
-        raise SQLValidationError(
-            "Query attempts to access system tables "
-            "(sqlite_master / sqlite_sequence / etc.)."
-        )
+    if FORBIDDEN_KEYWORDS.search(cleaned):
+        raise SQLValidationError("The generated SQL contains a blocked statement.")
+
+    if DANGEROUS_KEYWORDS.search(cleaned):
+        raise SQLValidationError("The generated SQL contains a dangerous keyword.")
+
+    if SYSTEM_TABLES.search(cleaned):
+        raise SQLValidationError("System tables are not allowed.")
 
     return cleaned

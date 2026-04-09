@@ -1,24 +1,11 @@
-# Environment & secrets
 .env
-*.env
-
-# Database
-clinic.db
-*.db
-
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
 .venv/
-venv/
-env/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-
-# OS
-.DS_Store
-Thumbs.db
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+clinic.db
+memory_store.json
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

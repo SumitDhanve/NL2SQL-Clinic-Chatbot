@@ -1,620 +1,232 @@
-"""
-main.py  ─  NL2SQL Clinic Chatbot  (fully async)
-=================================================
-Every I/O operation is non-blocking:
-  • aiosqlite  ─ async SQLite queries
-  • asyncio.to_thread()  ─ offloads CPU/blocking work (agent, charts, pandas)
-  • asyncio.Lock()  ─ thread-safe cache & rate-limit stores
-  • @asynccontextmanager lifespan  ─ clean startup / shutdown
+"""FastAPI application for the clinic NL2SQL system."""
 
-Start:
-    uvicorn main:app --port 8000 --reload
+from __future__ import annotations
 
-Endpoints:
-    POST /chat    ─ natural-language question → SQL → results + chart
-    GET  /health  ─ DB status + agent memory count
-"""
-
+import json
+import logging
 import os
 import re
-import json
-import asyncio
-import logging
-import time
+import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import Any, Optional, Tuple, Union
+from typing import Any
 
-import aiosqlite
-import plotly.express as px
 import pandas as pd
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+import plotly.express as px
+import plotly.graph_objects as go
 from dotenv import load_dotenv
-from vanna.core.user import RequestContext
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, field_validator
 
-from sql_validator import validate_sql, SQLValidationError
-from vanna_setup import build_agent
+from sql_validator import SQLValidationError, validate_sql
+from vanna_setup import (
+    build_agent,
+    call_llm_for_sql,
+    check_database_exists,
+    get_agent_memory_item_count,
+    verify_database_connection,
+)
 
-# ──────────────────────────────────────────────────────────────────────────
-# Bootstrap
-# ──────────────────────────────────────────────────────────────────────────
 
 load_dotenv()
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("nl2sql")
+logger = logging.getLogger("clinic-nl2sql")
 
-DB_PATH     = os.getenv("DB_PATH", "clinic.db")
-RATE_LIMIT  = int(os.getenv("RATE_LIMIT",  "20"))   # max requests per window
-RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))   # window in seconds
-
-# Lazily populated in lifespan()
-_agent:        Any = None
-_agent_memory: Any = None
-
-# Async-safe in-memory cache and rate-limit store
-_cache:           dict[str, dict]         = {}
-_rate_store:      dict[str, list[float]]  = {}
-_cache_lock       = asyncio.Lock()
-_rate_store_lock  = asyncio.Lock()
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Lifespan  (startup / shutdown)
-# ──────────────────────────────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Build the Vanna 2.0 agent once at startup.
-    build_agent() is synchronous, so we run it in a thread to keep the
-    event loop free during startup.
-    """
-    global _agent, _agent_memory
-    log.info("Startup — building Vanna 2.0 agent …")
-    _agent, _agent_memory = build_agent()
-    log.info("Agent ready ✓")
-    yield
-    log.info("Shutdown complete.")
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# App
-# ──────────────────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="NL2SQL Clinic Chatbot",
-    description="Ask questions about clinic data in plain English.",
-    version="2.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Pydantic schemas
-# ──────────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    question: str = Field(..., min_length=3, max_length=500,
-                          description="Natural-language question about the clinic data")
+    question: str = Field(..., min_length=3, max_length=500)
 
-    @validator("question")
-    def not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("question must not be blank")
-        return v.strip()
-
-
-class ChartPayload(BaseModel):
-    data:   list[Any]
-    layout: dict[str, Any]
+    @field_validator("question")
+    @classmethod
+    def validate_question(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Question must not be empty.")
+        return cleaned
 
 
 class ChatResponse(BaseModel):
     message: str
-    sql_query: Optional[str] = None
-    columns: Optional[list[str]] = None
-    rows: Optional[list[list[Any]]] = None
-    row_count: Optional[int] = None
-    chart: Optional[ChartPayload] = None
-    chart_type: Optional[str] = None
-    cached: bool = False
+    sql_query: str | None = None
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[Any]] = Field(default_factory=list)
+    row_count: int = 0
+    chart: dict[str, Any] | None = None
+    chart_type: str | None = None
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Async rate limiter
-# ──────────────────────────────────────────────────────────────────────────
-
-async def check_rate_limit(ip: str) -> None:
-    """
-    Raise HTTP 429 if *ip* has exceeded RATE_LIMIT requests in RATE_WINDOW seconds.
-    Uses asyncio.Lock so concurrent requests from the same IP are handled safely.
-    """
-    now = time.monotonic()
-    async with _rate_store_lock:
-        history = _rate_store.get(ip, [])
-        # Discard timestamps outside the rolling window
-        history = [t for t in history if now - t < RATE_WINDOW]
-        if len(history) >= RATE_LIMIT:
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Rate limit exceeded — max {RATE_LIMIT} requests "
-                    f"per {RATE_WINDOW}s."
-                ),
-            )
-        history.append(now)
-        _rate_store[ip] = history
+class HealthResponse(BaseModel):
+    status: str
+    database: str
+    agent_memory_items: int
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Async DB helper
-# ──────────────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    check_database_exists()
+    verify_database_connection()
+    app.state.vanna = build_agent()
+    logger.info("Vanna agent initialized successfully.")
+    yield
 
-async def async_run_sql(sql: str) -> tuple[list[str], list[list]]:
-    """
-    Execute *sql* against clinic.db using aiosqlite.
-    Fully non-blocking — does not touch the thread pool.
-    Returns (column_names, rows).
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(sql) as cursor:
-            columns = [d[0] for d in cursor.description] if cursor.description else []
-            raw     = await cursor.fetchall()
-            rows    = [list(r) for r in raw]
+
+app = FastAPI(
+    title="Clinic NL2SQL API",
+    version="1.0.0",
+    description="Natural language to SQL API using Vanna 2.0, FastAPI, SQLite, and Plotly.",
+    lifespan=lifespan,
+)
+
+SQL_CACHE: dict[str, str] = {}
+
+
+def extract_sql(candidate_text: str) -> str:
+    """Extract the first SQL query from raw model output."""
+    fenced = re.search(r"```(?:sql)?\s*(SELECT[\s\S]*?)```", candidate_text, flags=re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip()
+
+    match = re.search(r"(SELECT[\s\S]*)", candidate_text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+
+    return candidate_text.strip()
+
+
+def execute_select(sql_query: str) -> tuple[list[str], list[list[Any]]]:
+    """Execute a validated SELECT query against SQLite."""
+    with sqlite3.connect(os.getenv("DB_PATH", "clinic.db")) as connection:
+        cursor = connection.execute(sql_query)
+        columns = [description[0] for description in cursor.description or []]
+        rows = [list(row) for row in cursor.fetchall()]
     return columns, rows
 
 
-async def async_db_health() -> str:
-    """Return 'connected' or 'disconnected' for the SQLite database."""
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("SELECT 1")
-        return "connected"
-    except Exception as exc:
-        log.error("DB health check failed: %s", exc)
-        return "disconnected"
+def choose_chart_columns(dataframe: pd.DataFrame) -> tuple[str, str] | None:
+    """Pick a reasonable x/y pair for chart generation."""
+    if dataframe.empty or dataframe.shape[1] < 2:
+        return None
+
+    numeric_columns = dataframe.select_dtypes(include=["number"]).columns.tolist()
+    if not numeric_columns:
+        return None
+
+    y_column = numeric_columns[0]
+    x_candidates = [column for column in dataframe.columns if column != y_column]
+    if not x_candidates:
+        return None
+
+    return x_candidates[0], y_column
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Async agent caller
-# ──────────────────────────────────────────────────────────────────────────
+def build_chart(columns: list[str], rows: list[list[Any]]) -> tuple[dict[str, Any] | None, str | None]:
+    """Generate a Plotly chart when the result looks chart-friendly."""
+    if not rows or len(columns) < 2:
+        return None, None
 
-async def async_ask_agent(question: str) -> str:
-    prompt = f"""
-You are a strict SQL generator.
+    dataframe = pd.DataFrame(rows, columns=columns)
+    selected = choose_chart_columns(dataframe)
+    if not selected:
+        return None, None
 
-Your job:
-Convert user question into ONLY a valid SQLite SQL query.
+    x_column, y_column = selected
+    x_series = dataframe[x_column]
 
-Database schema:
-
-patients(id, first_name, last_name, email, phone, date_of_birth, gender, city, registered_date)
-doctors(id, name, specialization, department, phone)
-appointments(id, patient_id, doctor_id, appointment_date, status, notes)
-treatments(id, appointment_id, treatment_name, cost, duration_minutes)
-invoices(id, patient_id, invoice_date, total_amount, paid_amount, status)
-
-Rules:
-- Output ONLY SQL query
-- DO NOT explain anything
-- DO NOT return empty response
-- ALWAYS generate SQL
-- Use correct joins if needed
-
-Examples:
-
-Q: How many patients do we have?
-A: SELECT COUNT(*) FROM patients;
-
-Q: List all doctors and their specializations
-A: SELECT name, specialization FROM doctors;
-
-Q: List patients who visited more than 3 times
-A: SELECT patient_id, COUNT(*) as visit_count FROM appointments GROUP BY patient_id HAVING COUNT(*) > 3;
-
-Now convert:
-
-Q: {question}
-A:
-"""
-
-    result = ""
-
-    async for chunk in _agent.send_message(
-        message=prompt,
-        request_context=RequestContext()
-    ):
-        if hasattr(chunk, "text") and chunk.text:
-            result += chunk.text
-        elif isinstance(chunk, str):
-            result += chunk
-
-    return result.strip()
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Async chart builder
-# ──────────────────────────────────────────────────────────────────────────
-
-async def async_build_chart(
-    columns: list[str],
-    rows: list[list],
-) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Build a Plotly chart (pandas + JSON serialisation) in a thread pool.
-    Returns (chart_dict, chart_type) or (None, None) if not applicable.
-    """
-    def _build() -> Tuple[Optional[dict], Optional[str]]:
-        if not rows or len(columns) < 2:
-            return None, None
-        try:
-            df       = pd.DataFrame(rows, columns=columns)
-            num_cols = df.select_dtypes(include="number").columns.tolist()
-            if not num_cols:
-                return None, None
-
-            x_col = columns[0]
-            y_col = num_cols[0]
-
-            if len(df) <= 10:
-                fig   = px.bar(df, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
-                ctype = "bar"
-            else:
-                fig   = px.line(df, x=x_col, y=y_col, title=f"{y_col} over {x_col}")
-                ctype = "line"
-
-            payload = json.loads(fig.to_json())
-            return {"data": payload["data"], "layout": payload["layout"]}, ctype
-        except Exception as exc:
-            log.warning("Chart generation failed: %s", exc)
-            return None, None
-
-    return await asyncio.to_thread(_build)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# SQL extractor
-# ──────────────────────────────────────────────────────────────────────────
-
-def extract_sql(text: str) -> Optional[str]:
-    """
-    Pull the first SELECT block out of *text*.
-    Looks for ```sql ... ``` fences first, then a bare SELECT … ; statement.
-    """
-    m = re.search(r"```(?:sql)?\s*(SELECT[\s\S]+?)```", text, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"(SELECT\s+[\s\S]+?;)", text, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return None
-
-
-def generate_sql(question: str) -> str:
-    q = question.lower()
-
-    # 1. Total patients
-    if "how many patients" in q:
-        return "SELECT COUNT(*) AS total_patients FROM patients;"
-
-    # 2. Doctors list
-    if "doctors" in q and "specialization" in q:
-        return "SELECT name, specialization FROM doctors;"
-
-    # 3. Appointments last month
-    if "appointments" in q and "last month" in q:
-        return """
-        SELECT * FROM appointments
-        WHERE appointment_date >= date('now','-1 month');
-        """
-
-    # 4. Doctor with most appointments
-    if "most appointments" in q:
-        return """
-        SELECT d.name, COUNT(a.id) AS total_appointments
-        FROM doctors d
-        JOIN appointments a ON d.id = a.doctor_id
-        GROUP BY d.id
-        ORDER BY total_appointments DESC
-        LIMIT 1;
-        """
-
-    # 5. Total revenue
-    if "total revenue" in q:
-        return "SELECT SUM(total_amount) AS total_revenue FROM invoices;"
-
-    # 6. Revenue by doctor
-    if "revenue by doctor" in q:
-        return """
-        SELECT d.name, SUM(t.cost) AS revenue
-        FROM doctors d
-        JOIN appointments a ON d.id = a.doctor_id
-        JOIN treatments t ON a.id = t.appointment_id
-        GROUP BY d.id;
-        """
-
-    # 7. Cancelled appointments last quarter
-    if "cancelled" in q and "last quarter" in q:
-        return """
-        SELECT COUNT(*) AS cancelled_count
-        FROM appointments
-        WHERE status = 'cancelled'
-        AND appointment_date >= date('now','-3 months');
-        """
-
-    # 8. Top 5 patients
-    if "top 5 patients" in q or "spending" in q:
-        return """
-        SELECT p.first_name, p.last_name, SUM(i.total_amount) AS total_spending
-        FROM patients p
-        JOIN invoices i ON p.id = i.patient_id
-        GROUP BY p.id
-        ORDER BY total_spending DESC
-        LIMIT 5;
-        """
-
-    # 9. Avg treatment cost by specialization
-    if "average treatment cost" in q or "avg treatment cost" in q:
-        return """
-        SELECT d.specialization, AVG(t.cost) AS avg_cost
-        FROM doctors d
-        JOIN appointments a ON d.id = a.doctor_id
-        JOIN treatments t ON a.id = t.appointment_id
-        GROUP BY d.specialization;
-        """
-
-    # 10. Monthly appointment count (6 months)
-    if "monthly appointment" in q or "past 6 months" in q:
-        return """
-        SELECT strftime('%Y-%m', appointment_date) AS month,
-               COUNT(*) AS total_appointments
-        FROM appointments
-        WHERE appointment_date >= date('now','-6 months')
-        GROUP BY month
-        ORDER BY month;
-        """
-
-    # 11. City with most patients
-    if "city" in q and "most patients" in q:
-        return """
-        SELECT city, COUNT(*) AS total_patients
-        FROM patients
-        GROUP BY city
-        ORDER BY total_patients DESC
-        LIMIT 1;
-        """
-
-    # 12. Patients visited > 3 times
-    if "visited more than 3 times" in q:
-        return """
-        SELECT patient_id, COUNT(*) AS visit_count
-        FROM appointments
-        GROUP BY patient_id
-        HAVING COUNT(*) > 3;
-        """
-
-    # 13. Unpaid invoices
-    if "unpaid invoices" in q:
-        return """
-        SELECT *
-        FROM invoices
-        WHERE status = 'unpaid' OR paid_amount < total_amount;
-        """
-
-    # 14. No-show percentage
-    if "no-show" in q:
-        return """
-        SELECT 
-        (COUNT(CASE WHEN status = 'no-show' THEN 1 END) * 100.0 / COUNT(*)) AS no_show_percentage
-        FROM appointments;
-        """
-
-    # 15. Busiest day
-    if "busiest day" in q:
-        return """
-        SELECT strftime('%w', appointment_date) AS day_of_week,
-               COUNT(*) AS total_appointments
-        FROM appointments
-        GROUP BY day_of_week
-        ORDER BY total_appointments DESC
-        LIMIT 1;
-        """
-
-    # 16. Revenue trend
-    if "revenue trend" in q:
-        return """
-        SELECT strftime('%Y-%m', invoice_date) AS month,
-               SUM(total_amount) AS revenue
-        FROM invoices
-        GROUP BY month
-        ORDER BY month;
-        """
-
-    # 17. Avg appointment duration
-    if "appointment duration" in q:
-        return """
-        SELECT d.name, AVG(t.duration_minutes) AS avg_duration
-        FROM doctors d
-        JOIN appointments a ON d.id = a.doctor_id
-        JOIN treatments t ON a.id = t.appointment_id
-        GROUP BY d.id;
-        """
-
-    # 18. Overdue invoices
-    if "overdue invoices" in q:
-        return """
-        SELECT p.first_name, p.last_name, i.invoice_date, i.total_amount
-        FROM patients p
-        JOIN invoices i ON p.id = i.patient_id
-        WHERE i.status = 'unpaid'
-        AND i.invoice_date < date('now','-30 days');
-        """
-
-    # 19. Revenue by department
-    if "department" in q and "revenue" in q:
-        return """
-        SELECT d.department, SUM(t.cost) AS revenue
-        FROM doctors d
-        JOIN appointments a ON d.id = a.doctor_id
-        JOIN treatments t ON a.id = t.appointment_id
-        GROUP BY d.department;
-        """
-
-    # 20. Patient registration trend
-    if "registration trend" in q:
-        return """
-        SELECT strftime('%Y-%m', registered_date) AS month,
-               COUNT(*) AS total_registrations
-        FROM patients
-        GROUP BY month
-        ORDER BY month;
-        """
-
-    # Default fallback
-    return "SELECT * FROM patients LIMIT 5;"
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# POST /chat
-# ──────────────────────────────────────────────────────────────────────────
-
-@app.post(
-    "/chat",
-    response_model=ChatResponse,
-    summary="Ask a natural-language question about the clinic data",
-)
-async def chat(req: ChatRequest, request: Request) -> Union[ChatResponse, JSONResponse]:
-    client_ip = request.client.host
-    await check_rate_limit(client_ip)
-
-    question = req.question
-    log.info("[%s] Question: %s", client_ip, question)
-
-    # ── Cache check ──────────────────────────────────────────────────────
-    async with _cache_lock:
-        if question in _cache:
-            log.info("[%s] Cache hit", client_ip)
-            hit = dict(_cache[question])
-            hit["cached"] = True
-            return JSONResponse(content=hit)
-
-    # ── Step 1: Ask agent ────────────────────────────────────────────────
-    try:
-        raw_text = await async_ask_agent(question)
-    except Exception as exc:
-        log.error("Agent error: %s", exc)
-        raw_text = ""
-
-    # ── Step 2: Extract SQL ──────────────────────────────────────────────
-    sql_raw = extract_sql(raw_text)
-
-    # 🔥 FALLBACK if LLM fails
-    if not sql_raw:
-        sql_raw = generate_sql(question)
-        log.warning("Using fallback SQL")
-
-    sql_clean: Optional[str] = None
-    columns: Optional[list[str]] = None
-    rows: Optional[list[list[Any]]] = None
-    chart: Optional[ChartPayload] = None
-    chart_type: Optional[str] = None
-
-    # ── Step 3: Validate SQL ─────────────────────────────────────────────
-    try:
-        sql_clean = validate_sql(sql_raw)
-    except SQLValidationError as exc:
-        return JSONResponse(
-            status_code=200,
-            content=ChatResponse(
-                message=f"SQL rejected: {exc}",
-                sql_query=sql_raw,
-            ).dict(),
-        )
-
-    # ── Step 4: Execute SQL ──────────────────────────────────────────────
-    try:
-        columns, rows = await async_run_sql(sql_clean)
-    except Exception as exc:
-        return JSONResponse(
-            status_code=200,
-            content=ChatResponse(
-                message=f"SQL execution failed: {exc}",
-                sql_query=sql_clean,
-            ).dict(),
-        )
-
-    # ── Step 5: Message ──────────────────────────────────────────────────
-    if rows:
-        message = f"Here are the results for: {question}"
+    if pd.api.types.is_datetime64_any_dtype(x_series) or "date" in x_column.lower() or "month" in x_column.lower():
+        figure = px.line(dataframe, x=x_column, y=y_column, markers=True, title=f"{y_column} by {x_column}")
+        chart_type = "line"
+    elif len(dataframe) <= 20:
+        figure = px.bar(dataframe, x=x_column, y=y_column, title=f"{y_column} by {x_column}")
+        chart_type = "bar"
     else:
-        message = "No data found for your query."
+        figure = go.Figure(
+            data=[
+                go.Scatter(
+                    x=dataframe[x_column],
+                    y=dataframe[y_column],
+                    mode="lines+markers",
+                    name=y_column,
+                )
+            ]
+        )
+        figure.update_layout(title=f"{y_column} by {x_column}")
+        chart_type = "line"
 
-    # ── Step 6: Chart ────────────────────────────────────────────────────
-    chart_data, chart_type = await async_build_chart(columns or [], rows or [])
-    if chart_data:
-        chart = ChartPayload(**chart_data)
+    payload = json.loads(figure.to_json())
+    return {"data": payload["data"], "layout": payload["layout"]}, chart_type
 
-    # ── Final response ───────────────────────────────────────────────────
-    response = ChatResponse(
-        message=message,
-        sql_query=sql_clean,
+
+async def cached_sql(question: str) -> str:
+    """Cache SQL generation for repeated questions."""
+    if question in SQL_CACHE:
+        return SQL_CACHE[question]
+
+    raw_response = await call_llm_for_sql(app.state.vanna, question)
+    sql = extract_sql(raw_response)
+    SQL_CACHE[question] = sql
+    return sql
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest) -> ChatResponse:
+    """Translate a natural language question into SQL, run it, and return results."""
+    try:
+        generated_sql = await cached_sql(request.question)
+        safe_sql = validate_sql(generated_sql)
+    except SQLValidationError as exc:
+        logger.warning("Blocked unsafe SQL for question %s: %s", request.question, exc)
+        return ChatResponse(
+            message=f"Generated SQL was rejected by the safety validator: {exc}",
+            sql_query=generated_sql if "generated_sql" in locals() else None,
+        )
+    except Exception as exc:
+        logger.exception("SQL generation failed.")
+        raise HTTPException(status_code=500, detail=f"Failed to generate SQL: {exc}") from exc
+
+    try:
+        columns, rows = execute_select(safe_sql)
+    except sqlite3.Error as exc:
+        logger.exception("SQLite execution failed.")
+        return ChatResponse(
+            message=f"The generated SQL could not be executed: {exc}",
+            sql_query=safe_sql,
+        )
+
+    if not rows:
+        return ChatResponse(
+            message="No data found for the given question.",
+            sql_query=safe_sql,
+            columns=columns,
+            rows=[],
+            row_count=0,
+        )
+
+    chart, chart_type = build_chart(columns, rows)
+    return ChatResponse(
+        message="Query executed successfully.",
+        sql_query=safe_sql,
         columns=columns,
         rows=rows,
-        row_count=len(rows) if rows else 0,
+        row_count=len(rows),
         chart=chart,
         chart_type=chart_type,
-        cached=False,
     )
 
-    # ── Cache ────────────────────────────────────────────────────────────
-    async with _cache_lock:
-        _cache[question] = response.dict()
 
-    return response
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Basic health check for API and database readiness."""
+    try:
+        verify_database_connection()
+        database_status = "connected"
+    except Exception:
+        database_status = "disconnected"
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# GET /health
-# ──────────────────────────────────────────────────────────────────────────
-
-@app.get("/health", summary="Health check — DB status + agent memory count")
-async def health() -> dict:
-    # Both operations run concurrently via asyncio.gather
-    db_status, memory_count = await asyncio.gather(
-        async_db_health(),
-        asyncio.to_thread(lambda: len(_agent_memory.list()) if _agent_memory else 0),
-    )
-    return {
-        "status":              "ok",
-        "database":            db_status,
-        "agent_memory_items":  memory_count,
-        "timestamp":           datetime.utcnow().isoformat() + "Z",
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Global error handler
-# ──────────────────────────────────────────────────────────────────────────
-
-@app.exception_handler(Exception)
-async def global_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    log.exception("Unhandled exception: %s", exc)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "An unexpected error occurred. Please try again."},
+    return HealthResponse(
+        status="ok",
+        database=database_status,
+        agent_memory_items=get_agent_memory_item_count(app.state.vanna.seed_examples),
     )

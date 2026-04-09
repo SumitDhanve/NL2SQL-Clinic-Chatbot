@@ -1,25 +1,7 @@
-# Core Vanna 2.0 with SQLite + Gemini support
 vanna[gemini,sqlite]>=2.0.0
-
-# API framework
-fastapi
-uvicorn[standard]
-
-# Async SQLite driver
-aiosqlite
-
-# Data / charts
-plotly
-pandas
-
-# Env vars
-python-dotenv
-
-# LLM Provider — uncomment ONE block:
-# ── Option A: Google Gemini (default, free via AI Studio) ──
-google-genai
-
-# ── Option B: Groq (free tier) ──
-# groq
-
-# ── Option C: Ollama — no extra package; install the Ollama app separately ──
+google-genai>=1.0.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+plotly>=5.24.0
+pandas>=2.2.0
+python-dotenv>=1.0.0
