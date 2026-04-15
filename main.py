@@ -23,6 +23,8 @@ from vanna_setup import (
     call_llm_for_sql,
     check_database_exists,
     get_agent_memory_item_count,
+    LlmServiceUnavailableError,
+    repair_sql_with_error,
     verify_database_connection,
 )
 
@@ -182,6 +184,15 @@ async def chat(request: ChatRequest) -> ChatResponse:
             message=f"Generated SQL was rejected by the safety validator: {exc}",
             sql_query=generated_sql if "generated_sql" in locals() else None,
         )
+    except LlmServiceUnavailableError as exc:
+        logger.warning("LLM provider unavailable for question %s: %s", request.question, exc)
+        return ChatResponse(
+            message=str(exc),
+            sql_query=None,
+            columns=[],
+            rows=[],
+            row_count=0,
+        )
     except Exception as exc:
         logger.exception("SQL generation failed.")
         raise HTTPException(status_code=500, detail=f"Failed to generate SQL: {exc}") from exc
@@ -189,11 +200,24 @@ async def chat(request: ChatRequest) -> ChatResponse:
     try:
         columns, rows = execute_select(safe_sql)
     except sqlite3.Error as exc:
-        logger.exception("SQLite execution failed.")
-        return ChatResponse(
-            message=f"The generated SQL could not be executed: {exc}",
-            sql_query=safe_sql,
-        )
+        logger.warning("Initial SQL failed, attempting one repair pass: %s", exc)
+        try:
+            repaired_sql = extract_sql(
+                await repair_sql_with_error(
+                    app.state.vanna,
+                    request.question,
+                    safe_sql,
+                    str(exc),
+                )
+            )
+            safe_sql = validate_sql(repaired_sql)
+            columns, rows = execute_select(safe_sql)
+        except Exception as repair_exc:
+            logger.exception("SQLite execution failed after repair attempt.")
+            return ChatResponse(
+                message=f"The generated SQL could not be executed: {repair_exc}",
+                sql_query=safe_sql,
+            )
 
     if not rows:
         return ChatResponse(

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,61 +21,9 @@ MEMORY_STORE_PATH = Path(os.getenv("MEMORY_STORE_PATH", "memory_store.json"))
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 DEFAULT_USER_GROUP = "users"
 DEFAULT_MEMORY_LIMIT = 1000
-
-
-DDL_SNIPPETS = [
-    """
-    CREATE TABLE patients (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        first_name TEXT NOT NULL,
-        last_name TEXT NOT NULL,
-        email TEXT,
-        phone TEXT,
-        date_of_birth DATE,
-        gender TEXT,
-        city TEXT,
-        registered_date DATE
-    );
-    """.strip(),
-    """
-    CREATE TABLE doctors (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        specialization TEXT NOT NULL,
-        department TEXT NOT NULL,
-        phone TEXT
-    );
-    """.strip(),
-    """
-    CREATE TABLE appointments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        patient_id INTEGER NOT NULL,
-        doctor_id INTEGER NOT NULL,
-        appointment_date DATETIME NOT NULL,
-        status TEXT NOT NULL,
-        notes TEXT
-    );
-    """.strip(),
-    """
-    CREATE TABLE treatments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        appointment_id INTEGER NOT NULL UNIQUE,
-        treatment_name TEXT NOT NULL,
-        cost REAL NOT NULL,
-        duration_minutes INTEGER NOT NULL
-    );
-    """.strip(),
-    """
-    CREATE TABLE invoices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        patient_id INTEGER NOT NULL,
-        invoice_date DATE NOT NULL,
-        total_amount REAL NOT NULL,
-        paid_amount REAL NOT NULL,
-        status TEXT NOT NULL
-    );
-    """.strip(),
-]
+MAX_EXAMPLES_IN_PROMPT = 6
+LLM_RETRY_ATTEMPTS = int(os.getenv("LLM_RETRY_ATTEMPTS", "3"))
+LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.5"))
 
 
 SEED_EXAMPLES = [
@@ -93,54 +43,6 @@ SEED_EXAMPLES = [
         "question": "How many patients are registered in each city?",
         "sql": "SELECT city, COUNT(*) AS patient_count FROM patients GROUP BY city ORDER BY patient_count DESC, city",
     },
-    {
-        "question": "Which city has the most patients?",
-        "sql": "SELECT city, COUNT(*) AS patient_count FROM patients GROUP BY city ORDER BY patient_count DESC LIMIT 1",
-    },
-    {
-        "question": "How many appointments does each doctor have?",
-        "sql": "SELECT d.name, COUNT(a.id) AS appointment_count FROM doctors d LEFT JOIN appointments a ON d.id = a.doctor_id GROUP BY d.id, d.name ORDER BY appointment_count DESC, d.name",
-    },
-    {
-        "question": "Which doctor has the most appointments?",
-        "sql": "SELECT d.name, COUNT(a.id) AS appointment_count FROM doctors d JOIN appointments a ON d.id = a.doctor_id GROUP BY d.id, d.name ORDER BY appointment_count DESC LIMIT 1",
-    },
-    {
-        "question": "Show appointments for last month",
-        "sql": "SELECT id, patient_id, doctor_id, appointment_date, status FROM appointments WHERE appointment_date >= date('now', 'start of month', '-1 month') AND appointment_date < date('now', 'start of month') ORDER BY appointment_date",
-    },
-    {
-        "question": "How many cancelled appointments last quarter?",
-        "sql": "SELECT COUNT(*) AS cancelled_appointments FROM appointments WHERE status = 'Cancelled' AND appointment_date >= date('now', '-3 months')",
-    },
-    {
-        "question": "Show monthly appointment count for the past 6 months",
-        "sql": "SELECT strftime('%Y-%m', appointment_date) AS month, COUNT(*) AS appointment_count FROM appointments WHERE appointment_date >= date('now', '-5 months', 'start of month') GROUP BY strftime('%Y-%m', appointment_date) ORDER BY month",
-    },
-    {
-        "question": "What is the total revenue?",
-        "sql": "SELECT ROUND(SUM(total_amount), 2) AS total_revenue FROM invoices",
-    },
-    {
-        "question": "Show revenue by doctor",
-        "sql": "SELECT d.name, ROUND(SUM(t.cost), 2) AS total_revenue FROM doctors d JOIN appointments a ON d.id = a.doctor_id JOIN treatments t ON a.id = t.appointment_id GROUP BY d.id, d.name ORDER BY total_revenue DESC, d.name",
-    },
-    {
-        "question": "Show unpaid invoices",
-        "sql": "SELECT id, patient_id, invoice_date, total_amount, paid_amount, status FROM invoices WHERE status IN ('Pending', 'Overdue') ORDER BY invoice_date DESC",
-    },
-    {
-        "question": "Top 5 patients by spending",
-        "sql": "SELECT p.first_name, p.last_name, ROUND(SUM(i.total_amount), 2) AS total_spending FROM patients p JOIN invoices i ON p.id = i.patient_id GROUP BY p.id, p.first_name, p.last_name ORDER BY total_spending DESC, p.last_name, p.first_name LIMIT 5",
-    },
-    {
-        "question": "Average treatment cost by specialization",
-        "sql": "SELECT d.specialization, ROUND(AVG(t.cost), 2) AS average_treatment_cost FROM doctors d JOIN appointments a ON d.id = a.doctor_id JOIN treatments t ON a.id = t.appointment_id GROUP BY d.specialization ORDER BY average_treatment_cost DESC, d.specialization",
-    },
-    {
-        "question": "Show revenue trend by month",
-        "sql": "SELECT strftime('%Y-%m', invoice_date) AS month, ROUND(SUM(total_amount), 2) AS revenue FROM invoices GROUP BY strftime('%Y-%m', invoice_date) ORDER BY month",
-    },
 ]
 
 
@@ -153,6 +55,11 @@ class VannaContext:
     llm_service: Any
     sql_runner: Any
     seed_examples: list[dict[str, str]]
+    schema_text: str
+
+
+class LlmServiceUnavailableError(RuntimeError):
+    """Raised when the configured LLM provider is temporarily unavailable."""
 
 
 def ensure_memory_store() -> list[dict[str, str]]:
@@ -256,21 +163,90 @@ def build_agent() -> VannaContext:
         config=AgentConfig(),
     )
 
+    seed_examples = ensure_memory_store()
     return VannaContext(
         agent=agent,
         agent_memory=agent_memory,
         llm_service=llm_service,
         sql_runner=sql_runner,
-        seed_examples=ensure_memory_store(),
+        seed_examples=seed_examples,
+        schema_text=build_schema_text(),
     )
 
 
-def build_prompt(question: str, seed_examples: list[dict[str, str]]) -> str:
-    """Compose a SQL-only prompt grounded in schema and saved examples."""
+def build_schema_text() -> str:
+    """Read the live SQLite schema so prompts stay aligned with the database."""
+    with sqlite3.connect(DB_PATH) as connection:
+        table_names = [
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+                """
+            ).fetchall()
+        ]
+
+        schema_blocks: list[str] = []
+        for table_name in table_names:
+            columns = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+            foreign_keys = connection.execute(f"PRAGMA foreign_key_list({table_name})").fetchall()
+
+            column_lines = [
+                f"- {column[1]} {column[2]}{' PRIMARY KEY' if column[5] else ''}"
+                for column in columns
+            ]
+            fk_lines = [
+                f"- {fk[3]} -> {fk[2]}.{fk[4]}"
+                for fk in foreign_keys
+            ]
+
+            block = [f"Table: {table_name}", "Columns:"]
+            block.extend(column_lines)
+            if fk_lines:
+                block.append("Foreign keys:")
+                block.extend(fk_lines)
+            schema_blocks.append("\n".join(block))
+
+    return "\n\n".join(schema_blocks)
+
+
+def tokenize_question(text: str) -> set[str]:
+    """Tokenize a question for simple example retrieval."""
+    return set(re.findall(r"[a-z0-9_]+", text.lower()))
+
+
+def select_relevant_examples(
+    question: str,
+    seed_examples: list[dict[str, str]],
+    limit: int = MAX_EXAMPLES_IN_PROMPT,
+) -> list[dict[str, str]]:
+    """Pick the most relevant saved examples for the current question."""
+    question_tokens = tokenize_question(question)
+    scored_examples: list[tuple[int, dict[str, str]]] = []
+
+    for example in seed_examples:
+        example_tokens = tokenize_question(example["question"])
+        score = len(question_tokens & example_tokens)
+        scored_examples.append((score, example))
+
+    ranked = sorted(
+        scored_examples,
+        key=lambda item: (item[0], len(item[1]["question"])),
+        reverse=True,
+    )
+    return [example for _, example in ranked[:limit]]
+
+
+def build_prompt(question: str, schema_text: str, seed_examples: list[dict[str, str]]) -> str:
+    """Compose a SQL-only prompt grounded in the live schema and relevant examples."""
+    selected_examples = select_relevant_examples(question, seed_examples)
     example_block = "\n\n".join(
-        f"Question: {item['question']}\nSQL: {item['sql']}" for item in seed_examples[:8]
+        f"Question: {item['question']}\nSQL: {item['sql']}" for item in selected_examples
     )
-    ddl_block = "\n\n".join(DDL_SNIPPETS)
     return f"""
 You are an expert SQLite SQL generator for a clinic analytics application.
 
@@ -281,12 +257,14 @@ Rules:
 - Only generate SELECT statements.
 - Never use INSERT, UPDATE, DELETE, DROP, ALTER, EXEC, PRAGMA, or system tables.
 - Prefer explicit JOIN conditions and readable aliases.
-- Use the saved examples and schema below.
+- Use the live database schema and the relevant examples below.
+- If the user asks for a metric, aggregation, comparison, trend, top-N result, or date filter that is not shown in the examples, infer the correct SQL from the schema.
+- Do not refuse just because the question is new. Generate the best valid SQL query you can.
 
 Database schema:
-{ddl_block}
+{schema_text}
 
-Saved examples:
+Relevant examples:
 {example_block}
 
 User question:
@@ -302,7 +280,11 @@ async def call_llm_for_sql(vanna_context: VannaContext, question: str) -> str:
     but this method keeps execution separate so we can validate SQL before
     touching the database.
     """
-    prompt = build_prompt(question, vanna_context.seed_examples)
+    prompt = build_prompt(
+        question=question,
+        schema_text=vanna_context.schema_text,
+        seed_examples=vanna_context.seed_examples,
+    )
     from vanna.core.llm.models import LlmMessage, LlmRequest
     from vanna.core.user.models import User
 
@@ -317,10 +299,81 @@ async def call_llm_for_sql(vanna_context: VannaContext, question: str) -> str:
         temperature=0.1,
         max_tokens=800,
     )
-    response = await vanna_context.llm_service.send_request(llm_request)
-    if getattr(response, "content", None):
-        return str(response.content).strip()
-    raise RuntimeError("The configured Vanna LLM service returned an empty response.")
+    return await _send_llm_request_with_retry(vanna_context, llm_request)
+
+
+async def repair_sql_with_error(
+    vanna_context: VannaContext,
+    question: str,
+    failed_sql: str,
+    error_message: str,
+) -> str:
+    """Ask the LLM for a corrected SQL query after a SQLite execution error."""
+    from vanna.core.llm.models import LlmMessage, LlmRequest
+    from vanna.core.user.models import User
+
+    repair_prompt = f"""
+You generated a SQLite query for a clinic analytics system, but SQLite returned an error.
+
+Return exactly one corrected SELECT query and nothing else.
+Do not explain the fix.
+Keep the intent of the user's question unchanged.
+
+Live database schema:
+{vanna_context.schema_text}
+
+User question:
+{question}
+
+Previous SQL:
+{failed_sql}
+
+SQLite error:
+{error_message}
+""".strip()
+
+    llm_request = LlmRequest(
+        messages=[LlmMessage(role="user", content=repair_prompt)],
+        user=User(
+            id="default-user",
+            email="default-user@local",
+            group_memberships=[DEFAULT_USER_GROUP],
+        ),
+        stream=False,
+        temperature=0.0,
+        max_tokens=800,
+    )
+    return await _send_llm_request_with_retry(vanna_context, llm_request)
+
+
+async def _send_llm_request_with_retry(vanna_context: VannaContext, llm_request: Any) -> str:
+    """Send an LLM request with retry/backoff for transient provider failures."""
+    last_error: Exception | None = None
+
+    for attempt in range(1, LLM_RETRY_ATTEMPTS + 1):
+        try:
+            response = await vanna_context.llm_service.send_request(llm_request)
+            if getattr(response, "content", None):
+                return str(response.content).strip()
+            raise RuntimeError("The configured Vanna LLM service returned an empty response.")
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc).upper()
+            is_transient = any(
+                token in error_text
+                for token in ("503", "UNAVAILABLE", "TIMEOUT", "RATE LIMIT", "429", "RESOURCE_EXHAUSTED")
+            )
+            if not is_transient or attempt == LLM_RETRY_ATTEMPTS:
+                break
+            await asyncio.sleep(LLM_RETRY_BASE_DELAY * attempt)
+
+    if last_error is not None:
+        raise LlmServiceUnavailableError(
+            "The AI provider is temporarily unavailable or rate-limited. "
+            "Please retry in a few moments."
+        ) from last_error
+
+    raise LlmServiceUnavailableError("The AI provider did not return a valid response.")
 
 
 def check_database_exists() -> None:
